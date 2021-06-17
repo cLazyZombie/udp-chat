@@ -7,6 +7,7 @@ pub enum Packets {
     LoginReq(LoginReqPacket),
     ChatReq(ChatReqPacket),
     ChatNotify(ChatNotifyPacket),
+    Ping,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

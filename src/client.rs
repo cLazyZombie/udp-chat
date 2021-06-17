@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use std::io::BufRead;
 use std::net::UdpSocket;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use udp_chat::{ChatReqPacket, LoginReqPacket, Packets, MAX_PACKET_SIZE};
 
@@ -19,19 +19,26 @@ fn main() -> std::io::Result<()> {
 
     socket.send(bytes)?;
 
+    let last_ping = Arc::new(Mutex::new(std::time::Instant::now()));
+
     // receive thread
     let receive_socket = Arc::clone(&socket);
+    let last_ping_cloned = Arc::clone(&last_ping);
     std::thread::spawn(move || loop {
         let mut buf = [0; MAX_PACKET_SIZE];
         let result = receive_socket.recv(&mut buf);
         match result {
             Ok(size) => {
-                let read_buf = &buf[0..size];
+                let read_buf = &buf[..size];
                 let read_packet = serde_json::from_slice::<Packets>(read_buf);
                 match read_packet {
                     Ok(chat_packet) => match chat_packet {
                         Packets::ChatNotify(chat_notify) => {
                             println!("{}: {}", chat_notify.name, chat_notify.contents);
+                        }
+                        Packets::Ping => {
+                            let mut locked = last_ping_cloned.lock().unwrap();
+                            *locked = std::time::Instant::now();
                         }
                         _ => {}
                     },
@@ -44,6 +51,11 @@ fn main() -> std::io::Result<()> {
                 eprintln!("recv error. {:?}", err);
             }
         }
+    });
+
+    // timer thread
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
     });
 
     let stdin = std::io::stdin();

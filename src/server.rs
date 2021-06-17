@@ -1,8 +1,7 @@
-use std::{
-    collections::HashMap,
-    net::{SocketAddr, UdpSocket},
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use udp_chat::{ChatNotifyPacket, Packets, MAX_PACKET_SIZE};
 
@@ -29,7 +28,18 @@ impl Users {
         self.users.get(&addr).map(|name| name.clone())
     }
 
-    fn send(&self, socket: &UdpSocket, name: &str, contents: &str) {
+    async fn ping(&self, socket: &UdpSocket) {
+        let packet = Packets::Ping;
+        let packet_json = serde_json::to_string(&packet).unwrap();
+        let packet_buf = packet_json.as_bytes();
+        for (user_addr, _) in &self.users {
+            if let Err(err) = socket.send_to(packet_buf, user_addr).await {
+                eprintln!("fail to send ping {:?}", err);
+            }
+        }
+    }
+
+    async fn send(&self, socket: &UdpSocket, name: &str, contents: &str) {
         let packet = Packets::ChatNotify(ChatNotifyPacket {
             name: name.to_string(),
             contents: contents.to_string(),
@@ -41,31 +51,39 @@ impl Users {
             eprintln!("packet size overflow. {}", packet_buf.len());
         } else {
             for (user_addr, _) in &self.users {
-                let result = socket.send_to(packet_buf, user_addr);
-                if let Err(err) = result {
-                    eprintln!("fail to send chat notify. {:?}", err);
+                match socket.send_to(packet_buf, user_addr).await {
+                    Ok(size) => {
+                        eprintln!("send to {:?}, size: {}", user_addr, size);
+                    }
+                    Err(err) => {
+                        eprintln!("fail to send chat notify. {:?}", err);
+                    }
                 }
             }
         }
     }
 }
 
+#[derive(Debug)]
 enum Message {
     Login((SocketAddr, String)),
     Chat((SocketAddr, String)),
     Logout(SocketAddr),
+    Tick,
 }
 
-fn main() -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:35600")?);
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:35600").await?);
 
-    let (sender, receiver) = crossbeam_channel::unbounded();
+    let (sender, mut receiver) = mpsc::unbounded_channel();
 
+    // process message channel to user
     let send_socket = Arc::clone(&socket);
-    std::thread::spawn(move || {
+    tokio::spawn(async move {
         let mut users = Users::new();
 
-        for msg in receiver {
+        while let Some(msg) = receiver.recv().await {
             match msg {
                 Message::Login((addr, name)) => {
                     users.add_user(addr, name);
@@ -76,17 +94,32 @@ fn main() -> std::io::Result<()> {
                 Message::Chat((addr, contents)) => {
                     let name = users.get_name(addr);
                     if let Some(name) = name {
-                        users.send(&send_socket, &name, &contents);
+                        users.send(&send_socket, &name, &contents).await;
                     }
+                }
+                Message::Tick => {
+                    users.ping(&send_socket).await;
                 }
             }
         }
     });
 
+    // timer (ping)
+    let ping_channel = sender.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            ping_channel.send(Message::Tick).unwrap();
+        }
+    });
+
     loop {
         let mut buf = [0; MAX_PACKET_SIZE];
-        let received = socket.recv_from(&mut buf);
+        let received = socket.recv_from(&mut buf).await;
         if let Err(err) = received {
+            if err.kind() == std::io::ErrorKind::ConnectionReset {
+                continue;
+            }
             eprintln!("recv_from err: {:?}", err);
             continue;
         }
