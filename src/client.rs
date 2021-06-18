@@ -58,17 +58,7 @@ async fn main() -> std::io::Result<()> {
 
     // timer thread
     let ping_socket = Arc::clone(&socket);
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            let packet = Packets::Ping;
-            let packet_json = serde_json::to_string(&packet).unwrap();
-            let packet_buf = packet_json.as_bytes();
-            if let Err(err) = ping_socket.send(packet_buf).await {
-                eprintln!("send ping failed. {:?}", err);
-            }
-        }
-    });
+    tokio::spawn(timer(ping_socket));
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -91,4 +81,16 @@ async fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+async fn timer(socket: Arc<UdpSocket>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let packet = Packets::Ping;
+        let packet_json = serde_json::to_string(&packet).unwrap();
+        let packet_buf = packet_json.as_bytes();
+        if let Err(err) = socket.send(packet_buf).await {
+            eprintln!("send ping failed. {:?}", err);
+        }
+    }
 }
