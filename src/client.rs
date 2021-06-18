@@ -1,13 +1,14 @@
 use rand::prelude::*;
 use std::io::BufRead;
-use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
+use tokio::net::UdpSocket;
 
 use udp_chat::{ChatReqPacket, LoginReqPacket, Packets, MAX_PACKET_SIZE};
 
-fn main() -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
-    socket.connect("127.0.0.1:35600")?;
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    socket.connect("127.0.0.1:35600").await?;
 
     let login = LoginReqPacket {
         name: format!("client#{}", random::<u32>()),
@@ -17,45 +18,56 @@ fn main() -> std::io::Result<()> {
     let json = serde_json::to_string(&login_packet).unwrap();
     let bytes = json.as_bytes();
 
-    socket.send(bytes)?;
+    socket.send(bytes).await?;
 
     let last_ping = Arc::new(Mutex::new(std::time::Instant::now()));
 
     // receive thread
     let receive_socket = Arc::clone(&socket);
     let last_ping_cloned = Arc::clone(&last_ping);
-    std::thread::spawn(move || loop {
-        let mut buf = [0; MAX_PACKET_SIZE];
-        let result = receive_socket.recv(&mut buf);
-        match result {
-            Ok(size) => {
-                let read_buf = &buf[..size];
-                let read_packet = serde_json::from_slice::<Packets>(read_buf);
-                match read_packet {
-                    Ok(chat_packet) => match chat_packet {
-                        Packets::ChatNotify(chat_notify) => {
-                            println!("{}: {}", chat_notify.name, chat_notify.contents);
+    tokio::spawn(async move {
+        loop {
+            let mut buf = [0; MAX_PACKET_SIZE];
+            let result = receive_socket.recv(&mut buf).await;
+            match result {
+                Ok(size) => {
+                    let read_buf = &buf[..size];
+                    let read_packet = serde_json::from_slice::<Packets>(read_buf);
+                    match read_packet {
+                        Ok(chat_packet) => match chat_packet {
+                            Packets::ChatNotify(chat_notify) => {
+                                println!("{}: {}", chat_notify.name, chat_notify.contents);
+                            }
+                            Packets::Ping => {
+                                let mut locked = last_ping_cloned.lock().unwrap();
+                                *locked = std::time::Instant::now();
+                            }
+                            _ => {}
+                        },
+                        Err(err) => {
+                            eprintln!("read packet error. {:?}", err);
                         }
-                        Packets::Ping => {
-                            let mut locked = last_ping_cloned.lock().unwrap();
-                            *locked = std::time::Instant::now();
-                        }
-                        _ => {}
-                    },
-                    Err(err) => {
-                        eprintln!("read packet error. {:?}", err);
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("recv error. {:?}", err);
+                Err(err) => {
+                    eprintln!("recv error. {:?}", err);
+                }
             }
         }
     });
 
     // timer thread
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+    let ping_socket = Arc::clone(&socket);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let packet = Packets::Ping;
+            let packet_json = serde_json::to_string(&packet).unwrap();
+            let packet_buf = packet_json.as_bytes();
+            if let Err(err) = ping_socket.send(packet_buf).await {
+                eprintln!("send ping failed. {:?}", err);
+            }
+        }
     });
 
     let stdin = std::io::stdin();
@@ -70,7 +82,7 @@ fn main() -> std::io::Result<()> {
                 continue;
             }
 
-            let result = socket.send(bytes);
+            let result = socket.send(bytes).await;
             if let Err(err) = result {
                 eprintln!("fail to send chat. {:?}", err);
                 break;

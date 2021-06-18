@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use udp_chat::{ChatNotifyPacket, Packets, MAX_PACKET_SIZE};
 
 struct Users {
-    users: HashMap<SocketAddr, String>,
+    users: HashMap<SocketAddr, User>,
 }
 
 impl Users {
@@ -17,7 +17,7 @@ impl Users {
     }
 
     fn add_user(&mut self, addr: SocketAddr, name: String) {
-        self.users.insert(addr, name);
+        self.users.insert(addr, User::new(name));
     }
 
     fn remove_user(&mut self, addr: SocketAddr) {
@@ -25,17 +25,32 @@ impl Users {
     }
 
     fn get_name(&self, addr: SocketAddr) -> Option<String> {
-        self.users.get(&addr).map(|name| name.clone())
+        self.users.get(&addr).map(|user| user.name.clone())
     }
 
-    async fn ping(&self, socket: &UdpSocket) {
-        let packet = Packets::Ping;
-        let packet_json = serde_json::to_string(&packet).unwrap();
-        let packet_buf = packet_json.as_bytes();
-        for (user_addr, _) in &self.users {
-            if let Err(err) = socket.send_to(packet_buf, user_addr).await {
-                eprintln!("fail to send ping {:?}", err);
+    async fn tick(&mut self, socket: &UdpSocket) {
+        // remove connection expired user
+        {
+            let now = std::time::Instant::now();
+            self.users.retain(|_, v| !v.is_expired(now));
+        }
+
+        // send ping to users
+        {
+            let packet = Packets::Ping;
+            let packet_json = serde_json::to_string(&packet).unwrap();
+            let packet_buf = packet_json.as_bytes();
+            for (user_addr, _) in &self.users {
+                if let Err(err) = socket.send_to(packet_buf, user_addr).await {
+                    eprintln!("fail to send ping {:?}", err);
+                }
             }
+        }
+    }
+
+    fn ping_received(&mut self, addr: SocketAddr) {
+        if let Some(user) = self.users.get_mut(&addr) {
+            user.update_ping();
         }
     }
 
@@ -64,11 +79,37 @@ impl Users {
     }
 }
 
+struct User {
+    name: String,
+    last_ping: std::time::Instant,
+}
+
+impl User {
+    const EXPIRED: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            last_ping: std::time::Instant::now(),
+        }
+    }
+
+    fn update_ping(&mut self) {
+        self.last_ping = std::time::Instant::now();
+    }
+
+    fn is_expired(&self, now: std::time::Instant) -> bool {
+        let duration = now - self.last_ping;
+        duration > Self::EXPIRED
+    }
+}
+
 #[derive(Debug)]
 enum Message {
     Login((SocketAddr, String)),
     Chat((SocketAddr, String)),
     Logout(SocketAddr),
+    PingReceived(SocketAddr),
     Tick,
 }
 
@@ -97,8 +138,11 @@ async fn main() -> std::io::Result<()> {
                         users.send(&send_socket, &name, &contents).await;
                     }
                 }
+                Message::PingReceived(addr) => {
+                    users.ping_received(addr);
+                }
                 Message::Tick => {
-                    users.ping(&send_socket).await;
+                    users.tick(&send_socket).await;
                 }
             }
         }
@@ -150,6 +194,10 @@ async fn main() -> std::io::Result<()> {
             }
             Packets::ChatReq(chat_req) => {
                 let msg = Message::Chat((client, chat_req.contents));
+                sender.send(msg).unwrap();
+            }
+            Packets::Ping => {
+                let msg = Message::PingReceived(client);
                 sender.send(msg).unwrap();
             }
             _ => {}
